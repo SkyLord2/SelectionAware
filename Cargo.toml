@@ -5,10 +5,19 @@ edition = "2024"
 
 [dependencies]
 windows = { version = "0.62.2", features = [
-    "Win32_UI_Accessibility",
-    "Win32_System_Com",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_LibraryLoader", #用于获取模块句柄
     "Win32_Foundation",
-    "Win32_System_Variant",
+    "Win32_UI_Accessibility", # UIA 相关
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",             # 用于截屏
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_WinRT",             # WinRT 基础
+    "UI_ViewManagement",
+    "Graphics_Imaging",               # SoftwareBitmap
+    "Media_Ocr",                      # OCR 核心
+    "Globalization",                  # 语言设置
+    "Storage_Streams",                # 数据流处理
 ] }
+tokio = { version = "1", features = ["full"] } # 需要异步运行时来等待 OCR 结果
