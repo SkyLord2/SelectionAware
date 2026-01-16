@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,12 +18,17 @@ use windows::{
 // 全局原子变量，用于记录鼠标左键按下的时间戳（毫秒）
 // 0 表示未按下
 static MOUSE_DOWN_TIME: AtomicU64 = AtomicU64::new(0);
+static MOUSE_DOWN_X: AtomicI32 = AtomicI32::new(0);
+static MOUSE_DOWN_Y: AtomicI32 = AtomicI32::new(0);
+static MOUSE_LAST_X: AtomicI32 = AtomicI32::new(0);
+static MOUSE_LAST_Y: AtomicI32 = AtomicI32::new(0);
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static WORKER_TX: OnceLock<mpsc::Sender<u64>> = OnceLock::new();
 
 // 定义“长按/拖拽”的阈值 (毫秒)
 // 如果按下到抬起的时间小于这个值，被视为普通点击，不触发识别
 const SELECTION_THRESHOLD_MS: u64 = 200;
+const DRAG_THRESHOLD_PX: i32 = 4;
 const CF_UNICODETEXT_U32: u32 = 13;
 
 fn main() -> Result<()> {
@@ -93,13 +98,31 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
         match msg {
             WM_LBUTTONDOWN => {
+                let hook_struct = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+                let x = hook_struct.pt.x;
+                let y = hook_struct.pt.y;
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
                 MOUSE_DOWN_TIME.store(now, Ordering::SeqCst);
+                MOUSE_DOWN_X.store(x, Ordering::SeqCst);
+                MOUSE_DOWN_Y.store(y, Ordering::SeqCst);
+                MOUSE_LAST_X.store(x, Ordering::SeqCst);
+                MOUSE_LAST_Y.store(y, Ordering::SeqCst);
+            }
+            WM_MOUSEMOVE => {
+                if MOUSE_DOWN_TIME.load(Ordering::SeqCst) != 0 {
+                    let hook_struct = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+                    MOUSE_LAST_X.store(hook_struct.pt.x, Ordering::SeqCst);
+                    MOUSE_LAST_Y.store(hook_struct.pt.y, Ordering::SeqCst);
+                }
             }
             WM_LBUTTONUP => {
+                let hook_struct = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+                MOUSE_LAST_X.store(hook_struct.pt.x, Ordering::SeqCst);
+                MOUSE_LAST_Y.store(hook_struct.pt.y, Ordering::SeqCst);
+
                 let start_time = MOUSE_DOWN_TIME.swap(0, Ordering::SeqCst);
                 if start_time > 0 {
                     let now = SystemTime::now()
@@ -107,10 +130,20 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let duration = now.saturating_sub(start_time);
+
+                    let down_x = MOUSE_DOWN_X.load(Ordering::SeqCst) as i64;
+                    let down_y = MOUSE_DOWN_Y.load(Ordering::SeqCst) as i64;
+                    let last_x = MOUSE_LAST_X.load(Ordering::SeqCst) as i64;
+                    let last_y = MOUSE_LAST_Y.load(Ordering::SeqCst) as i64;
+                    let dx = last_x - down_x;
+                    let dy = last_y - down_y;
+                    let moved_enough = dx * dx + dy * dy
+                        >= (DRAG_THRESHOLD_PX as i64) * (DRAG_THRESHOLD_PX as i64);
+
                     if duration >= SELECTION_THRESHOLD_MS
+                        && moved_enough
                         && let Some(tx) = WORKER_TX.get()
                     {
-                        // 钩子回调里不要做耗时/COM/剪贴板操作：只投递事件给 worker 线程处理。
                         let _ = tx.send(duration);
                     }
                 }
@@ -267,6 +300,11 @@ unsafe fn get_selection_via_copy_preserving_clipboard() -> Result<String> {
             break;
         }
         thread::sleep(Duration::from_millis(10));
+    }
+
+    if unsafe { GetClipboardSequenceNumber() } == original_seq {
+        unsafe { snapshot.restore() };
+        return Ok(String::new());
     }
 
     let copied_text = unsafe { read_clipboard_unicode_text() }.unwrap_or_default();
