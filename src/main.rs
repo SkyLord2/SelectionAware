@@ -22,8 +22,16 @@ static MOUSE_DOWN_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_DOWN_Y: AtomicI32 = AtomicI32::new(0);
 static MOUSE_LAST_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_LAST_Y: AtomicI32 = AtomicI32::new(0);
+static LAST_CLICK_UP_TIME: AtomicU64 = AtomicU64::new(0);
+static LAST_CLICK_UP_X: AtomicI32 = AtomicI32::new(0);
+static LAST_CLICK_UP_Y: AtomicI32 = AtomicI32::new(0);
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-static WORKER_TX: OnceLock<mpsc::Sender<u64>> = OnceLock::new();
+static WORKER_TX: OnceLock<mpsc::Sender<TriggerEvent>> = OnceLock::new();
+
+enum TriggerEvent {
+    Drag(u64),
+    DoubleClick,
+}
 
 // 定义“长按/拖拽”的阈值 (毫秒)
 // 如果按下到抬起的时间小于这个值，被视为普通点击，不触发识别
@@ -32,7 +40,7 @@ const DRAG_THRESHOLD_PX: i32 = 4;
 const CF_UNICODETEXT_U32: u32 = 13;
 
 fn main() -> Result<()> {
-    let (tx, rx) = mpsc::channel::<u64>();
+    let (tx, rx) = mpsc::channel::<TriggerEvent>();
     let _ = WORKER_TX.set(tx);
     let _ = thread::Builder::new()
         .name("uia-worker".to_string())
@@ -53,8 +61,9 @@ fn main() -> Result<()> {
         HOOK_HANDLE.store(hook_id.0, Ordering::SeqCst);
 
         println!("系统监控已启动...");
-        println!("请尝试：按住鼠标左键 -> 拖拽选中文字 -> 松开鼠标");
-        println!("(短按点击不会触发)");
+        println!("请尝试：");
+        println!("- 按住鼠标左键 -> 拖拽选中文字 -> 松开鼠标");
+        println!("- 鼠标左键双击选中文字");
 
         // 2. 开启 Windows 消息循环 (必须，否则钩子不生效)
         let mut msg = MSG::default();
@@ -70,7 +79,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn worker_loop(rx: mpsc::Receiver<u64>) {
+fn worker_loop(rx: mpsc::Receiver<TriggerEvent>) {
     unsafe {
         // UIAutomation 客户端建议在 MTA 中使用；STA 在部分场景下可能触发深层重入导致栈溢出。
         if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
@@ -78,10 +87,10 @@ fn worker_loop(rx: mpsc::Receiver<u64>) {
         }
     }
 
-    while let Ok(duration_ms) = rx.recv() {
+    while let Ok(event) = rx.recv() {
         // 给目标应用一点时间完成选区状态更新，避免过早读取到空选区。
         thread::sleep(Duration::from_millis(50));
-        perform_uia_detection(duration_ms);
+        perform_uia_detection(event);
     }
 
     unsafe {
@@ -120,8 +129,10 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             }
             WM_LBUTTONUP => {
                 let hook_struct = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-                MOUSE_LAST_X.store(hook_struct.pt.x, Ordering::SeqCst);
-                MOUSE_LAST_Y.store(hook_struct.pt.y, Ordering::SeqCst);
+                let up_x = hook_struct.pt.x;
+                let up_y = hook_struct.pt.y;
+                MOUSE_LAST_X.store(up_x, Ordering::SeqCst);
+                MOUSE_LAST_Y.store(up_y, Ordering::SeqCst);
 
                 let start_time = MOUSE_DOWN_TIME.swap(0, Ordering::SeqCst);
                 if start_time > 0 {
@@ -144,7 +155,36 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         && moved_enough
                         && let Some(tx) = WORKER_TX.get()
                     {
-                        let _ = tx.send(duration);
+                        let _ = tx.send(TriggerEvent::Drag(duration));
+                    }
+
+                    if moved_enough {
+                        LAST_CLICK_UP_TIME.store(0, Ordering::SeqCst);
+                    } else {
+                        let max_ms = unsafe { GetDoubleClickTime() } as u64;
+                        let cx = unsafe { GetSystemMetrics(SM_CXDOUBLECLK) };
+                        let cy = unsafe { GetSystemMetrics(SM_CYDOUBLECLK) };
+                        let half_cx = (cx / 2).max(1);
+                        let half_cy = (cy / 2).max(1);
+
+                        let last_time = LAST_CLICK_UP_TIME.load(Ordering::SeqCst);
+                        let last_x = LAST_CLICK_UP_X.load(Ordering::SeqCst);
+                        let last_y = LAST_CLICK_UP_Y.load(Ordering::SeqCst);
+
+                        let within_time = last_time != 0 && now.saturating_sub(last_time) <= max_ms;
+                        let within_rect =
+                            (up_x - last_x).abs() <= half_cx && (up_y - last_y).abs() <= half_cy;
+
+                        if within_time && within_rect {
+                            LAST_CLICK_UP_TIME.store(0, Ordering::SeqCst);
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(TriggerEvent::DoubleClick);
+                            }
+                        } else {
+                            LAST_CLICK_UP_TIME.store(now, Ordering::SeqCst);
+                            LAST_CLICK_UP_X.store(up_x, Ordering::SeqCst);
+                            LAST_CLICK_UP_Y.store(up_y, Ordering::SeqCst);
+                        }
                     }
                 }
             }
@@ -164,12 +204,19 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 // -----------------------------------------------------------------------------
 // UIA 识别逻辑 (运行在独立线程中)
 // -----------------------------------------------------------------------------
-fn perform_uia_detection(duration_ms: u64) {
+fn perform_uia_detection(event: TriggerEvent) {
     if let Ok(text) = get_focused_selection_with_fallback_copy()
         && !text.trim().is_empty()
     {
         println!("--------------------------------------------------");
-        println!("检测到长按/拖拽 ({}ms) 结束，捕获文本:", duration_ms);
+        match event {
+            TriggerEvent::Drag(duration_ms) => {
+                println!("检测到长按/拖拽 ({}ms) 结束，捕获文本:", duration_ms);
+            }
+            TriggerEvent::DoubleClick => {
+                println!("检测到鼠标双击选中，捕获文本:");
+            }
+        }
         println!(">>> {}", text);
         println!("--------------------------------------------------");
     }
