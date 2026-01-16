@@ -67,12 +67,14 @@ fn main() -> Result<()> {
 
 fn worker_loop(rx: mpsc::Receiver<u64>) {
     unsafe {
+        // UIAutomation 客户端建议在 MTA 中使用；STA 在部分场景下可能触发深层重入导致栈溢出。
         if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
             return;
         }
     }
 
     while let Ok(duration_ms) = rx.recv() {
+        // 给目标应用一点时间完成选区状态更新，避免过早读取到空选区。
         thread::sleep(Duration::from_millis(50));
         perform_uia_detection(duration_ms);
     }
@@ -108,6 +110,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                     if duration >= SELECTION_THRESHOLD_MS
                         && let Some(tx) = WORKER_TX.get()
                     {
+                        // 钩子回调里不要做耗时/COM/剪贴板操作：只投递事件给 worker 线程处理。
                         let _ = tx.send(duration);
                     }
                 }
@@ -184,6 +187,8 @@ struct ClipboardSnapshot {
 
 impl ClipboardSnapshot {
     unsafe fn capture() -> Result<Self> {
+        // 这里使用 Win32 剪贴板 API 做“数据级备份”：枚举所有格式并复制数据句柄。
+        // 目的：避免 OleSetClipboard(IDataObject) 成为 clipboard owner 后影响图片等格式的后续粘贴。
         unsafe { OpenClipboard(None)? };
         let mut items: Vec<(u32, HANDLE)> = Vec::new();
 
@@ -196,10 +201,14 @@ impl ClipboardSnapshot {
                     break;
                 }
                 let _ = unsafe { CloseClipboard() };
+                // 这里返回线程最近一次 Win32 错误（GetLastError）。
+                // rust-analyzer 在同名 HRESULT 类型上容易误判，因此避免手动拼 HRESULT。
                 return Err(windows::core::Error::from_thread());
             }
 
             if let Ok(handle) = unsafe { GetClipboardData(format) } {
+                // OleDuplicateData 会尝试把该格式的数据复制为可跨进程保存的句柄（多数常见格式有效）。
+                // 对延迟渲染/私有格式可能复制失败，此时只是不记录该格式，不会中断流程。
                 let dup = unsafe {
                     OleDuplicateData(
                         handle,
@@ -218,6 +227,8 @@ impl ClipboardSnapshot {
     }
 
     unsafe fn restore(self) {
+        // 恢复时会 EmptyClipboard + SetClipboardData，因此剪贴板 owner 一定会变为当前进程/线程。
+        // 但放回去的是“数据本体”，不会依赖本进程继续提供 IDataObject，从而避免图片粘贴丢失。
         let mut opened = false;
         for _ in 0..5 {
             if unsafe { OpenClipboard(None) }.is_ok() {
@@ -250,6 +261,7 @@ unsafe fn get_selection_via_copy_preserving_clipboard() -> Result<String> {
     let original_seq = unsafe { GetClipboardSequenceNumber() };
     unsafe { send_ctrl_c()? };
 
+    // 等待 Ctrl+C 触发目标应用写入剪贴板；用序列号变化作为信号避免盲等。
     for _ in 0..30 {
         if unsafe { GetClipboardSequenceNumber() } != original_seq {
             break;
@@ -258,6 +270,7 @@ unsafe fn get_selection_via_copy_preserving_clipboard() -> Result<String> {
     }
 
     let copied_text = unsafe { read_clipboard_unicode_text() }.unwrap_or_default();
+    // 无论是否读到文本都尝试恢复，尽量把剪贴板还原到触发前状态（图片等格式也包含在内）。
     unsafe { snapshot.restore() };
     Ok(copied_text)
 }
