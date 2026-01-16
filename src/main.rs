@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,12 +25,14 @@ static MOUSE_LAST_Y: AtomicI32 = AtomicI32::new(0);
 static LAST_CLICK_UP_TIME: AtomicU64 = AtomicU64::new(0);
 static LAST_CLICK_UP_X: AtomicI32 = AtomicI32::new(0);
 static LAST_CLICK_UP_Y: AtomicI32 = AtomicI32::new(0);
+static CLICK_UP_COUNT: AtomicU32 = AtomicU32::new(0);
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static WORKER_TX: OnceLock<mpsc::Sender<TriggerEvent>> = OnceLock::new();
 
 enum TriggerEvent {
     Drag(u64),
     DoubleClick,
+    TripleClick,
 }
 
 // 定义“长按/拖拽”的阈值 (毫秒)
@@ -64,6 +66,7 @@ fn main() -> Result<()> {
         println!("请尝试：");
         println!("- 按住鼠标左键 -> 拖拽选中文字 -> 松开鼠标");
         println!("- 鼠标左键双击选中文字");
+        println!("- 鼠标左键三击选中一行/段落文字");
 
         // 2. 开启 Windows 消息循环 (必须，否则钩子不生效)
         let mut msg = MSG::default();
@@ -160,7 +163,8 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
                     if moved_enough {
                         LAST_CLICK_UP_TIME.store(0, Ordering::SeqCst);
-                    } else {
+                        CLICK_UP_COUNT.store(0, Ordering::SeqCst);
+                    } else if duration < SELECTION_THRESHOLD_MS {
                         let max_ms = unsafe { GetDoubleClickTime() } as u64;
                         let cx = unsafe { GetSystemMetrics(SM_CXDOUBLECLK) };
                         let cy = unsafe { GetSystemMetrics(SM_CYDOUBLECLK) };
@@ -170,20 +174,35 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         let last_time = LAST_CLICK_UP_TIME.load(Ordering::SeqCst);
                         let last_x = LAST_CLICK_UP_X.load(Ordering::SeqCst);
                         let last_y = LAST_CLICK_UP_Y.load(Ordering::SeqCst);
+                        let last_count = CLICK_UP_COUNT.load(Ordering::SeqCst);
 
                         let within_time = last_time != 0 && now.saturating_sub(last_time) <= max_ms;
                         let within_rect =
                             (up_x - last_x).abs() <= half_cx && (up_y - last_y).abs() <= half_cy;
 
-                        if within_time && within_rect {
-                            LAST_CLICK_UP_TIME.store(0, Ordering::SeqCst);
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(TriggerEvent::DoubleClick);
-                            }
+                        let new_count = if within_time && within_rect {
+                            last_count.saturating_add(1)
                         } else {
-                            LAST_CLICK_UP_TIME.store(now, Ordering::SeqCst);
-                            LAST_CLICK_UP_X.store(up_x, Ordering::SeqCst);
-                            LAST_CLICK_UP_Y.store(up_y, Ordering::SeqCst);
+                            1
+                        };
+
+                        LAST_CLICK_UP_TIME.store(now, Ordering::SeqCst);
+                        LAST_CLICK_UP_X.store(up_x, Ordering::SeqCst);
+                        LAST_CLICK_UP_Y.store(up_y, Ordering::SeqCst);
+                        CLICK_UP_COUNT.store(new_count, Ordering::SeqCst);
+
+                        if let Some(tx) = WORKER_TX.get() {
+                            match new_count {
+                                2 => {
+                                    let _ = tx.send(TriggerEvent::DoubleClick);
+                                }
+                                3 => {
+                                    CLICK_UP_COUNT.store(0, Ordering::SeqCst);
+                                    LAST_CLICK_UP_TIME.store(0, Ordering::SeqCst);
+                                    let _ = tx.send(TriggerEvent::TripleClick);
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -215,6 +234,9 @@ fn perform_uia_detection(event: TriggerEvent) {
             }
             TriggerEvent::DoubleClick => {
                 println!("检测到鼠标双击选中，捕获文本:");
+            }
+            TriggerEvent::TripleClick => {
+                println!("检测到鼠标三击选中，捕获文本:");
             }
         }
         println!(">>> {}", text);
